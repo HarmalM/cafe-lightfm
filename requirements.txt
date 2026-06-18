@@ -1,31 +1,19 @@
-# CAFE-LightFM: Stage-Conditioned Attention Framework
-# Reproducible environment — Python 3.10+
-# Install: pip install -r requirements.txt
+# CAFE-LightFM — Colab-compatible requirements
+# Python 3.12 + CUDA 12.8 (Colab default as of 2026)
 
-# ── Core scientific stack ──────────────────────────────────────────────────────
-numpy==1.26.4
-scipy==1.13.1
-pandas==2.2.2
+# ── Pre-installed in Colab (verify only, do not reinstall) ────────────────
+# torch==2.11.0+cu128
+# numpy==2.0.2
+# scipy==1.16.3
+# scikit-learn==1.6.1
+# pandas==2.2.2
+# matplotlib
+# joblib==1.4.2
 
-# ── Machine learning ──────────────────────────────────────────────────────────
-scikit-learn==1.5.1
-torch==2.3.1                  # CAFE-LightFM SCA layer implemented in PyTorch
-lightfm==1.17                 # Baseline LightFM (Kula, 2015) — WARP loss
+# ── Install in Colab setup cell ───────────────────────────────────────────
+pyyaml>=6.0.1
 
-# ── Experiment tracking ───────────────────────────────────────────────────────
-tqdm==4.66.4
-tensorboard==2.17.0
-
-# ── Evaluation & statistics ───────────────────────────────────────────────────
-# NDCG, Precision@K implemented via sklearn + custom code (see evaluation/)
-
-# ── Visualization ─────────────────────────────────────────────────────────────
-matplotlib==3.9.1
-seaborn==0.13.2
-
-# ── Utilities ─────────────────────────────────────────────────────────────────
-pyyaml==6.0.1
-joblib==1.4.2
-
-# ── Notebook support (optional) ──────────────────────────────────────────────
-jupyterlab==4.2.3
+# ── LightFM baseline note ─────────────────────────────────────────────────
+# lightfm==1.17 is incompatible with Python 3.12 (ob_digit removal, PEP 659)
+# Baseline MF is implemented natively in PyTorch — see models/baselines/mf_baseline.py
+# lightfm installation will be attempted in experiments/baselines/ only
