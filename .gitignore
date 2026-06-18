@@ -1,0 +1,20 @@
+# Persistent/data artifacts — these live on Google Drive, not in git
+data/raw/*
+data/processed/*
+data/splits/*
+logs/*.log
+outputs/checkpoints/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+!data/splits/.gitkeep
+!logs/.gitkeep
+!outputs/checkpoints/.gitkeep
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.ipynb_checkpoints/
+
+# OS
+.DS_Store

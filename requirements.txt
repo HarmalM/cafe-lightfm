@@ -1,0 +1,31 @@
+# CAFE-LightFM: Stage-Conditioned Attention Framework
+# Reproducible environment — Python 3.10+
+# Install: pip install -r requirements.txt
+
+# ── Core scientific stack ──────────────────────────────────────────────────────
+numpy==1.26.4
+scipy==1.13.1
+pandas==2.2.2
+
+# ── Machine learning ──────────────────────────────────────────────────────────
+scikit-learn==1.5.1
+torch==2.3.1                  # CAFE-LightFM SCA layer implemented in PyTorch
+lightfm==1.17                 # Baseline LightFM (Kula, 2015) — WARP loss
+
+# ── Experiment tracking ───────────────────────────────────────────────────────
+tqdm==4.66.4
+tensorboard==2.17.0
+
+# ── Evaluation & statistics ───────────────────────────────────────────────────
+# NDCG, Precision@K implemented via sklearn + custom code (see evaluation/)
+
+# ── Visualization ─────────────────────────────────────────────────────────────
+matplotlib==3.9.1
+seaborn==0.13.2
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+pyyaml==6.0.1
+joblib==1.4.2
+
+# ── Notebook support (optional) ──────────────────────────────────────────────
+jupyterlab==4.2.3
