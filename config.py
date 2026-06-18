@@ -172,7 +172,7 @@ class CAFELightFMConfig:
     dropout_rate: float = 0.2
     learning_rate: float = 1e-3
     weight_decay: float = 1e-5
-    batch_size: int = 512
+    batch_size: int = 256
     max_epochs: int = 100
     early_stopping_patience: int = 10
     warp_n_samples: int = 10
