@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
-from interaction_schema import (
+from data.interaction_schema import (
     CategoricalFeatures,
     ContinuousSignals,
     DecisionStage,
