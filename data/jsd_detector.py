@@ -159,13 +159,84 @@ def split_half_internal_jsd(
     """
     Internal "noise floor" estimate: splits ONE session's events in half
     and computes the (averaged, per-signal) JSD between the two halves.
-    A real stage boundary should produce a between-session JSD well above
-    this floor; this is the placeholder substitute for MDL-based tau.
+
+    NOTE (confirmed 2026-06-24): this baseline was found UNSTABLE under
+    probabilistic stage leakage with small windows -- leaked events can
+    distribute unevenly across the two halves by chance, inflating this
+    estimate above the genuine between-session signal. It is retained
+    here for the Step 2/3 strongly-separable sanity-check dataset (where
+    it remains valid), but `cross_user_same_stage_baseline` below is the
+    methodologically preferred reference for realistic (Step 4+) data.
     """
     midpoint = len(session_records) // 2
     first_half = session_records[:midpoint]
     second_half = session_records[midpoint:]
     return average_signal_jsd(first_half, second_half, bin_edges_by_signal, epsilon)
+
+
+def cross_user_same_stage_baseline(
+    records: Sequence[InteractionRecord],
+    bin_edges_by_signal: Dict[str, np.ndarray],
+    epsilon: float = DEFAULT_EPSILON,
+    seed: int = 42,
+) -> List[Tuple[str, str, int, float]]:
+    """
+    Between-user, same-stage "no boundary" reference (confirmed
+    2026-06-24), replacing the split-half internal noise floor for
+    realistic (leakage-affected) data.
+
+    Rationale: the quantity Definition 5.1 actually requires distinguishing
+    is "a real adjacent-stage change" from "natural between-user
+    variability within the SAME stage" -- not an arbitrary within-session
+    split. Both positive and negative samples here use FULL-SESSION
+    windows (no window-size asymmetry, unlike split-half vs. full-session).
+
+        Positive pairs (elsewhere): same user, adjacent stages (sessions
+            i and i+1 for the same user_id).
+        Negative pairs (this function): DIFFERENT users, the SAME
+            (nominal) session index / stage.
+
+    Pairing is reproducible: users are shuffled with a seeded permutation
+    (seed=42 default, project convention), then paired via a circular
+    shift (user at shuffled position i with the user at position i+1),
+    once per session index, giving n_users negative pairs per stage with
+    no self-pairs.
+
+    Returns
+    -------
+    List[Tuple[str, str, int, float]]
+        (user_a, user_b, session_idx, jsd) for each negative pair.
+    """
+    grouped = group_by_user_session(records)
+    user_ids = sorted(grouped.keys())
+    n_users = len(user_ids)
+    if n_users < 2:
+        raise ValueError("Need at least 2 users to build a cross-user baseline.")
+
+    session_indices = sorted(
+        {int(sid.split("_s")[-1]) for sessions in grouped.values() for sid in sessions}
+    )
+
+    rng = np.random.default_rng(seed)
+    results: List[Tuple[str, str, int, float]] = []
+
+    for session_idx in session_indices:
+        shuffled_users = [user_ids[i] for i in rng.permutation(n_users)]
+        for i in range(n_users):
+            user_a = shuffled_users[i]
+            user_b = shuffled_users[(i + 1) % n_users]
+            if user_a == user_b:
+                continue
+            sid_a = f"{user_a}_s{session_idx}"
+            sid_b = f"{user_b}_s{session_idx}"
+            if sid_a not in grouped[user_a] or sid_b not in grouped[user_b]:
+                continue
+            jsd = average_signal_jsd(
+                grouped[user_a][sid_a], grouped[user_b][sid_b], bin_edges_by_signal, epsilon
+            )
+            results.append((user_a, user_b, session_idx, jsd))
+
+    return results
 
 
 # --------------------------------------------------------------------------- #
