@@ -183,6 +183,19 @@ def warp_loss(
             hinge = torch.clamp(margin - pos_score + violator_score, min=0.0)
             losses.append(weight * hinge)
         else:
-            losses.append(torch.zeros((), dtype=pos_scores.dtype))
+            # IMPORTANT FIX (confirmed 2026-06-26): use `pos_score * 0.0`
+            # rather than a detached `torch.zeros(())`. The detached zero
+            # has no grad_fn; if EVERY sample in a batch takes this path
+            # (e.g. a small item catalog where a user has interacted
+            # globally with the entire catalog, leaving no valid negative
+            # -- observed empirically on the Step 4 dataset with the
+            # GLOBAL exclusion scope), `torch.stack(losses)` would then
+            # have requires_grad=False entirely, and loss.backward()
+            # raises a RuntimeError. Multiplying pos_score by 0.0 keeps
+            # the tensor in the autograd graph (same zero VALUE and zero
+            # GRADIENT contribution) while guaranteeing the overall loss
+            # tensor always supports backward(), including late in
+            # training when violations become rare for a well-fit model.
+            losses.append(pos_score * 0.0)
 
     return torch.stack(losses).mean()
