@@ -30,7 +30,7 @@ import random
 
 import torch
 
-from data.interaction_matrix import build_interaction_matrix
+from data.interaction_matrix import InteractionMatrixBundle, build_interaction_matrix
 from data.synthetic_generator_v2 import generate_synthetic_dataset_v2, MASTER_SEED
 from models.baselines.lightfm_pytorch import LightFMPyTorch
 from models.cafe_lightfm.cafe_lightfm import CAFELightFM
@@ -44,6 +44,48 @@ from models.cafe_lightfm.warp_loss import (
 N_CATEGORIES, N_PROGRAMS, N_STAGES = 1, 3, 3
 EMBEDDING_DIM = 64
 SEED = 42
+
+
+def _build_toy_bundle() -> InteractionMatrixBundle:
+    """
+    A small, hand-controlled bundle with DELIBERATE negative-sampling
+    headroom (20 items, 3 positive per user => 17 valid negatives/user).
+
+    Used for gradient-flow / reproducibility tests instead of the real
+    Step 4 dataset (confirmed 2026-06-26): on that dataset, EVERY user
+    has interacted with ALL 10 catalog items GLOBALLY (empirically
+    verified), leaving zero valid negatives under the global exclusion
+    scope -- a genuine property of that dataset's item-catalog size
+    relative to its interaction volume, not a bug, but one that makes it
+    unsuitable for testing baseline-scorer gradient flow specifically.
+    This toy bundle isolates Step 3's WARP-loss mechanics from Step 1/4's
+    dataset-design choices.
+    """
+    n_users, n_items = 5, 20
+    user_id_to_idx = {f"u{i}": i for i in range(n_users)}
+    item_id_to_idx = {f"i{i}": i for i in range(n_items)}
+    item_feature_vocab = {
+        "item_category": {"cat0": 0},
+        "program_type": {"p0": 0, "p1": 1, "p2": 2},
+    }
+    item_feature_idx_by_item = {i: (0, i % 3) for i in range(n_items)}
+
+    positive_pairs = set()
+    positive_pairs_by_stage = {"S1": set(), "S2": set(), "S3": set()}
+    for u in range(n_users):
+        items = (u * 3, u * 3 + 1, u * 3 + 2)
+        for stage, item in zip(("S1", "S2", "S3"), items):
+            positive_pairs.add((u, item))
+            positive_pairs_by_stage[stage].add((u, item))
+
+    return InteractionMatrixBundle(
+        user_id_to_idx=user_id_to_idx,
+        item_id_to_idx=item_id_to_idx,
+        item_feature_vocab=item_feature_vocab,
+        item_feature_idx_by_item=item_feature_idx_by_item,
+        positive_pairs=positive_pairs,
+        positive_pairs_by_stage=positive_pairs_by_stage,
+    )
 
 
 class _SequenceRNG:
@@ -85,15 +127,14 @@ def test_exclusion_sets_differ_by_scope() -> None:
 
 
 def test_gradient_flow_baseline_scorer() -> None:
-    dataset = generate_synthetic_dataset_v2(seed=MASTER_SEED)
-    bundle = build_interaction_matrix(dataset)
+    bundle = _build_toy_bundle()
 
     torch.manual_seed(SEED)
     model = LightFMPyTorch(bundle.n_users, bundle.n_items, N_CATEGORIES, N_PROGRAMS, EMBEDDING_DIM)
     score_fn = baseline_scorer(model, bundle)
     user_positive_sets = build_user_positive_sets(bundle.positive_pairs)
 
-    pairs = list(bundle.positive_pairs)[:8]
+    pairs = list(bundle.positive_pairs)
     user_idx = torch.tensor([p[0] for p in pairs])
     item_idx = torch.tensor([p[1] for p in pairs])
 
@@ -104,12 +145,15 @@ def test_gradient_flow_baseline_scorer() -> None:
     assert loss.dim() == 0 and torch.isfinite(loss)
     loss.backward()
     assert model.item_embedding.weight.grad is not None
-    print(f"[PASS] WARP loss (baseline scorer) is finite ({loss.item():.4f}) and gradients flow")
+    assert model.item_embedding.weight.grad.abs().sum().item() > 0.0, (
+        "gradient is all-zero -- likely no violator was ever found; toy bundle should prevent this"
+    )
+    print(f"[PASS] WARP loss (baseline scorer, toy bundle) is finite ({loss.item():.4f}); "
+          f"gradients flow and are non-trivial")
 
 
 def test_gradient_flow_cafe_scorer() -> None:
-    dataset = generate_synthetic_dataset_v2(seed=MASTER_SEED)
-    bundle = build_interaction_matrix(dataset)
+    bundle = _build_toy_bundle()
 
     torch.manual_seed(SEED)
     model = CAFELightFM(bundle.n_users, bundle.n_items, N_CATEGORIES, N_PROGRAMS, N_STAGES, EMBEDDING_DIM)
@@ -117,7 +161,7 @@ def test_gradient_flow_cafe_scorer() -> None:
     score_fn = cafe_scorer(model, bundle, stage_idx=0)
     user_positive_sets = build_user_positive_sets(bundle.positive_pairs_by_stage[stage])
 
-    pairs = list(bundle.positive_pairs_by_stage[stage])[:8]
+    pairs = list(bundle.positive_pairs_by_stage[stage])
     user_idx = torch.tensor([p[0] for p in pairs])
     item_idx = torch.tensor([p[1] for p in pairs])
 
@@ -129,13 +173,12 @@ def test_gradient_flow_cafe_scorer() -> None:
     loss.backward()
     assert model.sca.w_base.grad is not None
     assert model.sca.w_stage.weight.grad is not None
-    print(f"[PASS] WARP loss (CAFE-LightFM scorer, stage={stage}) is finite ({loss.item():.4f}); "
+    print(f"[PASS] WARP loss (CAFE-LightFM scorer, toy bundle, stage={stage}) is finite ({loss.item():.4f}); "
           f"gradients reach SCA's w_base and w_stage")
 
 
 def test_reproducibility() -> None:
-    dataset = generate_synthetic_dataset_v2(seed=MASTER_SEED)
-    bundle = build_interaction_matrix(dataset)
+    bundle = _build_toy_bundle()
 
     torch.manual_seed(SEED)
     model_a = LightFMPyTorch(bundle.n_users, bundle.n_items, N_CATEGORIES, N_PROGRAMS, EMBEDDING_DIM)
@@ -143,7 +186,7 @@ def test_reproducibility() -> None:
     model_b = LightFMPyTorch(bundle.n_users, bundle.n_items, N_CATEGORIES, N_PROGRAMS, EMBEDDING_DIM)
 
     user_positive_sets = build_user_positive_sets(bundle.positive_pairs)
-    pairs = list(bundle.positive_pairs)[:8]
+    pairs = list(bundle.positive_pairs)
     user_idx = torch.tensor([p[0] for p in pairs])
     item_idx = torch.tensor([p[1] for p in pairs])
 
