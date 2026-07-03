@@ -34,8 +34,11 @@ one structural change to eliminate saturation:
 This bounds each user's global item coverage deterministically:
     max unique items per user <= 3 stages * 9 items/stage = 27 < 30
 guaranteeing >= 3 valid global negatives per user by construction (not
-merely with high probability), and exactly 21 valid stage-specific
-negatives per (user, stage) pair (30 - 9).
+merely with high probability). Note that events sample WITH replacement
+from each 9-item subset, so the number of DISTINCT items actually touched
+in one (user, stage) session can be < 9 -- the guarantee is therefore
+>= 21 valid stage-specific negatives per (user, stage) pair (30 - 9), a
+lower bound, not an exact count.
 
 References
 ----------
@@ -90,10 +93,14 @@ def _build_item_pool(n_items: int) -> List[str]:
 def _select_user_stage_item_subset(
     rng: np.random.Generator, item_pool: Sequence[str], coverage_fraction: float
 ) -> List[str]:
-    """Draws a fixed-size random subset (without replacement) of the item
-    catalog for one (user, stage) combination. This subset -- not the full
-    catalog -- is the sampling universe for every event in that session,
-    which is the structural change that eliminates global saturation."""
+    """Draws a fixed-size random subset (without replacement, at the
+    subset-selection level) of the item catalog for one (user, stage)
+    combination. This subset -- not the full catalog -- is the sampling
+    universe for every event in that session, which is the structural
+    change that eliminates global saturation. Individual events later
+    sample WITH replacement from this subset, so distinct items touched
+    per session is an upper bound of len(subset), not a guaranteed
+    exact count."""
     subset_size = max(1, round(len(item_pool) * coverage_fraction))
     chosen_idx = rng.choice(len(item_pool), size=subset_size, replace=False)
     return [item_pool[i] for i in sorted(chosen_idx)]
@@ -131,7 +138,10 @@ def generate_synthetic_dataset_v3(
         (user, stage) session (default 0.30).
     n_items : int
         Total catalog size (default 30, vs. 10 in v2 -- deliberately
-        larger to keep per-stage negative counts high: 30*(1-0.3)=21).
+        larger to keep per-stage negative counts high: guaranteed
+        >= 30*(1-0.3)=21 per (user, stage), since events sample the
+        9-item subset with replacement and may touch fewer than 9
+        distinct items).
     seed : int
         Master seed for the numpy Generator (default 42).
 
