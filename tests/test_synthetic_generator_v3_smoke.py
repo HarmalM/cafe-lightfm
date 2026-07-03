@@ -4,12 +4,13 @@ test_synthetic_generator_v3_smoke.py
 Smoke tests for data/synthetic_generator_v3.py (Phase 3, Step 1.5).
 
 Validates the 10 required conditions from the Step 1.5 decision log.
-Tests 1-9 are fully self-contained (schema + interaction_matrix only).
-Test 10 (baseline training loss != 0.0 across all epochs) requires the
-Phase 2 Step 4 training entry point and is intentionally left as a
-documented placeholder pending confirmation of its exact call signature
-(see NOTE at bottom of file) -- per project convention, this smoke test
-does not guess an unverified API.
+Tests 1-9 are self-contained (schema + interaction_matrix only). Test 10
+trains the LightFM baseline via experiments.training_loop.train_baseline
+(confirmed API, Phase 2 Step 4) and asserts its loss is not identically
+0.0 across all 10 epochs -- the empirical confirmation that the
+saturation fix from Step 1 actually resolves the training-blocking
+issue, not just the static negative-count guarantees checked by tests
+5-7.
 
 Run: python -m tests.test_synthetic_generator_v3_smoke
 """
@@ -107,6 +108,24 @@ def test_every_user_stage_pair_has_stage_negative() -> None:
     print("[PASS] (7) every (user, stage) pair has >=1 valid stage-specific negative")
 
 
+def test_full_catalog_represented() -> None:
+    """Confirms the 30-item catalog is actually represented across the
+    generated dataset. build_interaction_matrix() only indexes OBSERVED
+    items, so this check is not implied by N_ITEMS_V3 alone -- it must be
+    verified against the actual records and the resulting bundle."""
+    data = generate_synthetic_dataset_v3()
+    observed_items = {r.identifiers.item_id for r in data}
+    assert len(observed_items) == N_ITEMS_V3, (
+        f"observed {len(observed_items)} distinct items, expected all {N_ITEMS_V3} "
+        "to appear at least once across the full dataset"
+    )
+    bundle = build_interaction_matrix(data)
+    assert bundle.n_items == N_ITEMS_V3, (
+        f"bundle.n_items={bundle.n_items} != N_ITEMS_V3={N_ITEMS_V3}"
+    )
+    print(f"[PASS] (2b) full {N_ITEMS_V3}-item catalog is represented in the dataset and bundle")
+
+
 def test_positive_pairs_not_full_catalog() -> None:
     data = generate_synthetic_dataset_v3()
     bundle = build_interaction_matrix(data)
@@ -166,10 +185,11 @@ if __name__ == "__main__":
     test_uses_interaction_record_schema()
     test_stages_exactly_s1_s2_s3()
     test_leak_rate_approx_020()
+    test_full_catalog_represented()
     test_users_not_globally_saturated()
     test_every_user_has_global_negative()
     test_every_user_stage_pair_has_stage_negative()
     test_positive_pairs_not_full_catalog()
     test_positive_pairs_by_stage_nonempty_all_stages()
     test_baseline_loss_not_always_zero()
-    print("=== ALL 10/10 STEP 1.5 SMOKE TESTS PASSED ===")
+    print("=== ALL 10 REQUIRED CHECKS PASSED (+1 supplementary catalog-coverage check) ===")
