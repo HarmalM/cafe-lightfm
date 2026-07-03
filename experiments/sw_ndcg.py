@@ -62,14 +62,19 @@ _WEIGHT_SUM_TOLERANCE = 1e-9
 
 def _validate_weights(weights: Dict[str, float]) -> None:
     """
-    Validates that `weights` covers exactly {S1, S2, S3} and sums to 1.0
-    within floating-point tolerance. Raises ValueError otherwise -- fails
-    fast rather than silently producing a mis-scaled composite metric.
+    Validates that `weights` covers exactly {S1, S2, S3}, all weights are
+    non-negative, and they sum to 1.0 within floating-point tolerance.
+    Raises ValueError otherwise -- fails fast rather than silently
+    producing a mis-scaled (and potentially out-of-[0,1]) composite
+    metric, e.g. weights like {S1: 1.20, S2: -0.20, S3: 0.00} sum to 1.0
+    but are not a valid convex combination.
     """
     if set(weights.keys()) != set(STAGE_ORDER):
         raise ValueError(
             f"weights must cover exactly {set(STAGE_ORDER)}, got {set(weights.keys())}"
         )
+    if any(w < 0.0 for w in weights.values()):
+        raise ValueError(f"stage weights must be non-negative, got {weights}")
     total = sum(weights.values())
     if abs(total - 1.0) > _WEIGHT_SUM_TOLERANCE:
         raise ValueError(f"stage weights must sum to 1.0, got {total}")
