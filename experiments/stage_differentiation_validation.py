@@ -450,6 +450,13 @@ def write_markdown_report(
         "items reflect only shared-embedding interaction with "
         "`w_base`/`w_stage`, not genuine category-content differences.\n"
     )
+    lines.append(
+        "**Dataset note:** the loaded checkpoint inferred `n_categories=1`. "
+        "Therefore, on this synthetic-v3 run, item-level differences in "
+        "`alpha_category` should be interpreted cautiously. They do not "
+        "represent meaningful real-world category differences; they are only "
+        "a diagnostic artifact of the synthetic-v3 metadata construction.\n"
+    )
     lines.append("## 1. Aggregated attention matrix (2 features × {} stages)\n".format(n_stages))
     lines.append("Averaged across all catalog items, per stage.\n")
     header = "| feature | " + " | ".join(labels) + " |"
