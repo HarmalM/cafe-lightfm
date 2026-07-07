@@ -5,21 +5,38 @@ Phase 3, Step 7: smoke tests for the NEW logic introduced in
 experiments/step7_ablation_study.py (remap_bundle_to_2stage,
 compute_descriptive_table, run_cafe_variant_paired_comparison).
 
+REVISED (2026-07-08, PI-identified stub/production mismatch): the
+previous version of `_StubBundle` was a plain class. Once
+`remap_bundle_to_2stage()` was corrected to use
+`dataclasses.replace(bundle, positive_pairs_by_stage=...)` (required
+because the REAL InteractionMatrixBundle is a frozen dataclass --
+confirmed via a Colab traceback), `dataclasses.replace()` raises
+`TypeError: replace() should be called on dataclass instances` on any
+non-dataclass object, regardless of duck-typed attribute compatibility.
+`_StubBundle` is therefore now itself a `@dataclass(frozen=True)`,
+matching the real InteractionMatrixBundle's construction contract
+closely enough for `dataclasses.replace()` to operate on it, while
+remaining otherwise minimal and duck-typed (only the three attributes
+`remap_bundle_to_2stage` / `per_user_metric` / `generate_user_ranking`
+actually read: `positive_pairs_by_stage`, `n_items`,
+`item_feature_idx_by_item`).
+
 Fully self-contained (local _setup() helpers, no conftest.py
 dependency), per project test-pattern convention. Uses minimal
 duck-typed stubs for the bundle and model rather than the real
 InteractionMatrixBundle / CAFELightFM, so these tests exercise ONLY the
 wiring/aggregation logic this script adds -- not the real model's
 numerics or the real synthetic-v3 dataset. The full end-to-end run
-(real training, real checkpoints, real bundle) must be executed in
-Colab, per project convention.
+(real training, real checkpoints, real bundle) has already been
+executed and confirmed in Colab, per project convention.
 
 Reproducibility: seed=42 throughout, per project convention.
 """
 
 from __future__ import annotations
 
-from typing import Dict, List, Set, Tuple
+import dataclasses
+from typing import Dict, Set, Tuple
 
 import torch
 import torch.nn as nn
@@ -33,13 +50,27 @@ from experiments.step7_ablation_study import (
 MASTER_SEED = 42
 
 
+@dataclasses.dataclass(frozen=True)
 class _StubBundle:
-    """Minimal duck-typed stand-in for InteractionMatrixBundle."""
+    """
+    Minimal frozen-dataclass duck-typed stand-in for
+    InteractionMatrixBundle. Frozen to match the REAL
+    InteractionMatrixBundle's construction contract closely enough for
+    `dataclasses.replace()` (used by `remap_bundle_to_2stage`) to
+    operate on instances of this stub -- a plain class fails this with
+    `TypeError: replace() should be called on dataclass instances`
+    regardless of attribute duck-typing.
 
-    def __init__(self, positive_pairs_by_stage: Dict[str, Set[Tuple[int, int]]], n_items: int):
-        self.positive_pairs_by_stage = positive_pairs_by_stage
-        self.n_items = n_items
-        self.item_feature_idx_by_item = {i: (0, 0) for i in range(n_items)}
+    Only the three attributes actually read by
+    remap_bundle_to_2stage / per_user_metric / generate_user_ranking
+    are included; all other real-bundle fields (n_users, n_categories,
+    n_programs, positive_pairs, ...) are intentionally omitted since
+    nothing under test touches them.
+    """
+
+    positive_pairs_by_stage: Dict[str, Set[Tuple[int, int]]]
+    n_items: int
+    item_feature_idx_by_item: Dict[int, Tuple[int, int]]
 
 
 class _StubCAFEModel(nn.Module):
@@ -71,7 +102,13 @@ def _setup_3stage_bundle() -> _StubBundle:
         "S2": {(0, 2), (1, 0)},
         "S3": {(0, 0), (1, 1)},
     }
-    return _StubBundle(positive_pairs_by_stage=pairs_by_stage, n_items=4)
+    n_items = 4
+    item_feature_idx_by_item = {i: (0, 0) for i in range(n_items)}
+    return _StubBundle(
+        positive_pairs_by_stage=pairs_by_stage,
+        n_items=n_items,
+        item_feature_idx_by_item=item_feature_idx_by_item,
+    )
 
 
 def test_remap_bundle_to_2stage_merges_s2_s3_and_preserves_s1():
@@ -96,6 +133,10 @@ def test_remap_bundle_to_2stage_does_not_mutate_original():
 
 
 def test_remap_bundle_to_2stage_shares_other_fields():
+    """dataclasses.replace() copies unspecified fields by reference, so
+    item_feature_idx_by_item on the remapped bundle must be the SAME
+    object as on the original (not a deep copy) -- confirms
+    remap_bundle_to_2stage only overrides positive_pairs_by_stage."""
     bundle = _setup_3stage_bundle()
     remapped = remap_bundle_to_2stage(bundle)
     assert remapped.n_items == bundle.n_items
