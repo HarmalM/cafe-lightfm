@@ -94,17 +94,16 @@ NEW logic introduced by THIS script only (not duplicated elsewhere):
       driver -- see that module's Step 7 docstring note for why it
       cannot be reused directly for ablation-vs-ablation comparisons)
 
-ASSUMPTION (explicit, labeled -- requires Colab verification before
-trusting the 2Stage variant): `remap_bundle_to_2stage()` uses
-`copy.copy()` (shallow copy) and then reassigns the copy's
-`positive_pairs_by_stage` attribute. This assumes InteractionMatrixBundle
-instances support attribute reassignment after construction (i.e., it is
-NOT a frozen dataclass with immutable fields). If InteractionMatrixBundle
-IS frozen, this raises `dataclasses.FrozenInstanceError` at runtime, and
-`dataclasses.replace(bundle, positive_pairs_by_stage=...)` must be
-substituted instead. Impact if wrong: an immediate, loud crash (not a
-silent correctness bug) -- flagged here rather than silently guessed
-around.
+CONFIRMED (2026-07-08, via Colab traceback): InteractionMatrixBundle IS
+a frozen dataclass (`dataclasses.FrozenInstanceError: cannot assign to
+field 'positive_pairs_by_stage'`). The originally-flagged ASSUMPTION
+(attribute reassignment on a `copy.copy()`) was therefore WRONG and has
+been replaced below with `dataclasses.replace(bundle,
+positive_pairs_by_stage=...)`, which is the correct construction path
+for frozen dataclasses: it returns a NEW instance with the given
+field(s) overridden and all other fields copied from the original --
+no mutation of the original bundle occurs, and no `__init__` argument
+order needs to be known or guessed.
 
 Usage (Colab, from repo root):
     python -m experiments.step7_ablation_study
@@ -112,7 +111,6 @@ Usage (Colab, from repo root):
 
 from __future__ import annotations
 
-import copy
 import dataclasses
 import os
 from typing import Dict, List, Optional, Tuple
@@ -174,19 +172,20 @@ def remap_bundle_to_2stage(bundle: InteractionMatrixBundle) -> InteractionMatrix
     InteractionMatrixBundle with positive_pairs_by_stage =
         {"S1": <original S1 pairs>, "decision": <S2 union S3 pairs>}.
     All other fields (n_users, n_items, n_categories, n_programs,
-    item_feature_idx_by_item, positive_pairs, ...) are shared with the
-    original bundle (shallow copy), unmodified.
+    item_feature_idx_by_item, positive_pairs, ...) are copied unchanged
+    from the original bundle via dataclasses.replace().
     """
     s1 = bundle.positive_pairs_by_stage.get("S1", set())
     s2 = bundle.positive_pairs_by_stage.get("S2", set())
     s3 = bundle.positive_pairs_by_stage.get("S3", set())
 
-    new_bundle = copy.copy(bundle)
-    new_bundle.positive_pairs_by_stage = {
-        "S1": set(s1),
-        "decision": set(s2) | set(s3),
-    }
-    return new_bundle
+    return dataclasses.replace(
+        bundle,
+        positive_pairs_by_stage={
+            "S1": set(s1),
+            "decision": set(s2) | set(s3),
+        },
+    )
 
 
 # --------------------------------------------------------------------------- #
