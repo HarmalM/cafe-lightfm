@@ -33,18 +33,16 @@ PHASE 3, STEP 7 ADDITION (2026-07-06, confirmed by PI):
     mechanism for the "CAFE-LightFM-noAttention" ablation (proposal
     Section 5.6): when True, the w_base/w_stage logit computation is
     SKIPPED entirely and alpha is set to a constant uniform tensor
-    (1/n_features per feature). This guarantees w_base and w_stage never
-    enter the autograd graph for that forward call -- they receive zero
-    gradient and remain at their zero-initialized values throughout
-    training, which is exactly the "stage-specific embeddings without
-    attention weighting" condition the proposal specifies. Because the
-    layer is already verified to be numerically equivalent to the Step 1
-    baseline at zero-init (see module docstring, point 1, and
-    `test_equivalence_to_step1_baseline_at_init`), this flag reproduces
-    that same equivalence but HOLDS it fixed for the entire training run,
-    rather than allowing it to be an artifact of initialization only.
-    Default is `False`, so all existing (Step 1-6) call sites are
-    unaffected -- this is an additive, backward-compatible change.
+    (1/n_features per feature). Default is `False`, so all existing
+    (Step 1-6) call sites are unaffected.
+
+PHASE 3, STEP 7b ADDITION:
+    `fixed_alpha: Optional[Dict[str, torch.Tensor]] = None` added to
+    `__init__()`. This supports the "CAFE-LightFM-fixed-stage-weights"
+    ablation: when provided, alpha is not learned and is not computed
+    through softmax. Instead, the layer directly uses a fixed per-stage
+    attention vector. This preserves the original learned w_stage path
+    unchanged when fixed_alpha is None.
 
 References
 ----------
@@ -60,18 +58,93 @@ References
 
 from __future__ import annotations
 
-from typing import Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
+def _fixed_alpha_to_tensor(
+    fixed_alpha: Dict[str, torch.Tensor],
+    n_stages: int,
+) -> torch.Tensor:
+    """Validate and convert fixed per-stage alpha weights to a tensor.
+
+    Expected input format:
+        {
+            "S1": tensor([category_weight, program_weight]),
+            "S2": tensor([category_weight, program_weight]),
+            "S3": tensor([category_weight, program_weight]),
+        }
+
+    Returns
+    -------
+    torch.Tensor, shape (n_stages, n_features)
+        Rows ordered as S1, S2, S3, ...
+    """
+    expected_keys = {f"S{i + 1}" for i in range(n_stages)}
+    actual_keys = set(fixed_alpha.keys())
+
+    if actual_keys != expected_keys:
+        raise ValueError(
+            f"fixed_alpha must cover exactly {expected_keys}, got {actual_keys}"
+        )
+
+    rows = []
+    expected_shape = None
+
+    for i in range(n_stages):
+        stage_name = f"S{i + 1}"
+        vec = fixed_alpha[stage_name]
+
+        if not torch.is_tensor(vec):
+            vec = torch.tensor(vec, dtype=torch.float32)
+
+        vec = vec.detach().clone().to(dtype=torch.float32)
+
+        if vec.ndim != 1:
+            raise ValueError(
+                f"fixed_alpha[{stage_name}] must be 1-D, got shape {tuple(vec.shape)}"
+            )
+
+        if expected_shape is None:
+            expected_shape = vec.shape
+        elif vec.shape != expected_shape:
+            raise ValueError(
+                f"All fixed_alpha rows must have the same shape. "
+                f"Expected {tuple(expected_shape)}, got {tuple(vec.shape)} "
+                f"for {stage_name}."
+            )
+
+        if not torch.isfinite(vec).all():
+            raise ValueError(f"fixed_alpha[{stage_name}] contains non-finite values")
+
+        if torch.any(vec < 0):
+            raise ValueError(f"fixed_alpha[{stage_name}] contains negative weights")
+
+        total = vec.sum().item()
+        if abs(total - 1.0) > 1e-5:
+            raise ValueError(
+                f"fixed_alpha[{stage_name}] must sum to 1.0 within tolerance, "
+                f"got {total}"
+            )
+
+        rows.append(vec)
+
+    return torch.stack(rows, dim=0)
+
+
 class StageConditionedAttention(nn.Module):
     """Computes alpha(f, s_j) and the scale-corrected, stage-weighted sum
     of item metadata feature embeddings."""
 
-    def __init__(self, n_stages: int, embedding_dim: int) -> None:
+    def __init__(
+        self,
+        n_stages: int,
+        embedding_dim: int,
+        fixed_alpha: Optional[Dict[str, torch.Tensor]] = None,
+    ) -> None:
         super().__init__()
         self.n_stages = n_stages
         self.embedding_dim = embedding_dim
@@ -89,6 +162,14 @@ class StageConditionedAttention(nn.Module):
 
         # NOTE: no bias parameter here -- see module docstring, point 2
         # (the proposal's stage-only bias b_{s_j} cancels under softmax).
+
+        # NEW: Optional fixed per-stage alpha matrix for Step 7b.
+        # When None, all previous learned-attention behavior is unchanged.
+        if fixed_alpha is None:
+            self.register_buffer("fixed_alpha_tensor", None)
+        else:
+            fixed_alpha_tensor = _fixed_alpha_to_tensor(fixed_alpha, n_stages)
+            self.register_buffer("fixed_alpha_tensor", fixed_alpha_tensor)
 
     def forward(
         self,
@@ -118,6 +199,47 @@ class StageConditionedAttention(nn.Module):
         """
         n_features = feature_embeddings.shape[1]
 
+        # NEW: Step 7b fixed-stage-weights ablation.
+        # If fixed_alpha is provided, bypass learned softmax attention.
+        # This branch does NOT touch w_base or w_stage, so their gradients
+        # remain None/zero for this forward path.
+        if self.fixed_alpha_tensor is not None:
+            if freeze_uniform:
+                raise ValueError(
+                    "fixed_alpha and freeze_uniform are mutually exclusive. "
+                    "Use only one fixed-attention mode at a time."
+                )
+
+            if stage_idx.ndim != 1:
+                raise ValueError(
+                    f"stage_idx must be 1-D with shape (batch,), got {tuple(stage_idx.shape)}"
+                )
+
+            if self.fixed_alpha_tensor.shape[1] != n_features:
+                raise ValueError(
+                    f"fixed_alpha feature dimension mismatch: "
+                    f"fixed_alpha has {self.fixed_alpha_tensor.shape[1]} features, "
+                    f"but feature_embeddings has {n_features} features."
+                )
+
+            if torch.any(stage_idx < 0) or torch.any(stage_idx >= self.n_stages):
+                raise ValueError(
+                    f"stage_idx contains values outside valid range [0, {self.n_stages - 1}]"
+                )
+
+            stage_idx_for_buffer = stage_idx.to(
+                device=self.fixed_alpha_tensor.device,
+                dtype=torch.long,
+            )
+
+            alpha = self.fixed_alpha_tensor[stage_idx_for_buffer].to(
+                dtype=feature_embeddings.dtype,
+                device=feature_embeddings.device,
+            )
+
+            weighted = torch.einsum("bf,bfd->bd", alpha, feature_embeddings)
+            return n_features * weighted, alpha
+
         if freeze_uniform:
             batch = feature_embeddings.shape[0]
             alpha = torch.full(
@@ -129,6 +251,7 @@ class StageConditionedAttention(nn.Module):
             weighted = torch.einsum("bf,bfd->bd", alpha, feature_embeddings)
             return n_features * weighted, alpha
 
+        # ORIGINAL LEARNED PATH — unchanged.
         w_s = self.w_stage(stage_idx)  # (batch, d)
 
         logit_base = torch.einsum("bfd,d->bf", feature_embeddings, self.w_base)
@@ -156,21 +279,36 @@ if __name__ == "__main__":
     # 1. Default (freeze_uniform=False) at zero-init must be exactly
     #    uniform (1/n_features) -- pre-existing equivalence property.
     weighted_default, alpha_default = layer(feats, stage_idx)
-    assert torch.allclose(alpha_default, torch.full_like(alpha_default, 0.5), atol=1e-6), (
-        "Zero-init default forward should be exactly uniform alpha."
-    )
+    assert torch.allclose(
+        alpha_default,
+        torch.full_like(alpha_default, 0.5),
+        atol=1e-6,
+    ), "Zero-init default forward should be exactly uniform alpha."
 
-    # 2. freeze_uniform=True must produce identical alpha to (1), and
-    #    must NOT route gradient into w_base/w_stage.
+    # 2. freeze_uniform=True must produce identical alpha to (1).
     weighted_frozen, alpha_frozen = layer(feats, stage_idx, freeze_uniform=True)
-    assert torch.allclose(alpha_frozen, alpha_default, atol=1e-6), (
-        "freeze_uniform output should match the zero-init uniform case."
+    assert torch.allclose(
+        alpha_frozen,
+        alpha_default,
+        atol=1e-6,
+    ), "freeze_uniform output should match the zero-init uniform case."
+
+    assert torch.allclose(
+        weighted_frozen,
+        weighted_default,
+        atol=1e-6,
+    ), "freeze_uniform weighted sum should match zero-init weighted sum."
+
+    # 3. freeze_uniform=True must NOT route gradient into w_base/w_stage.
+    feats_for_grad = feats.detach().clone().requires_grad_(True)
+    weighted_frozen_grad, _ = layer(
+        feats_for_grad,
+        stage_idx,
+        freeze_uniform=True,
     )
-    assert torch.allclose(weighted_frozen, weighted_default, atol=1e-6), (
-        "freeze_uniform weighted sum should match zero-init weighted sum."
-    )
-    loss = weighted_frozen.sum()
+    loss = weighted_frozen_grad.sum()
     loss.backward()
+
     assert layer.w_base.grad is None or torch.all(layer.w_base.grad == 0), (
         "w_base must receive zero/None gradient when freeze_uniform=True."
     )
@@ -178,8 +316,60 @@ if __name__ == "__main__":
         "w_stage must receive zero/None gradient when freeze_uniform=True."
     )
 
-    # 3. alpha rows must sum to 1 in both modes.
+    # 4. alpha rows must sum to 1 in both default and freeze_uniform modes.
     assert torch.allclose(alpha_default.sum(dim=-1), torch.ones(5), atol=1e-6)
     assert torch.allclose(alpha_frozen.sum(dim=-1), torch.ones(5), atol=1e-6)
+
+    # 5. fixed_alpha must return the exact per-stage alpha values.
+    fixed_alpha = {
+        "S1": torch.tensor([0.6144, 0.3856], dtype=torch.float32),
+        "S2": torch.tensor([0.6035, 0.3965], dtype=torch.float32),
+        "S3": torch.tensor([0.6724, 0.3276], dtype=torch.float32),
+    }
+    fixed_layer = StageConditionedAttention(
+        n_stages=3,
+        embedding_dim=4,
+        fixed_alpha=fixed_alpha,
+    )
+
+    weighted_fixed, alpha_fixed = fixed_layer(feats, stage_idx)
+    expected_alpha = torch.stack(
+        [
+            fixed_alpha["S1"],
+            fixed_alpha["S2"],
+            fixed_alpha["S3"],
+            fixed_alpha["S1"],
+            fixed_alpha["S2"],
+        ],
+        dim=0,
+    )
+
+    assert torch.allclose(alpha_fixed, expected_alpha, atol=1e-6), (
+        "fixed_alpha mode must return the exact locked per-stage values."
+    )
+    assert torch.allclose(alpha_fixed.sum(dim=-1), torch.ones(5), atol=1e-6), (
+        "fixed_alpha rows must sum to 1."
+    )
+
+    # 6. fixed_alpha must NOT route gradient into w_base/w_stage.
+    feats_fixed_grad = feats.detach().clone().requires_grad_(True)
+    weighted_fixed_grad, _ = fixed_layer(feats_fixed_grad, stage_idx)
+    fixed_loss = weighted_fixed_grad.sum()
+    fixed_loss.backward()
+
+    assert fixed_layer.w_base.grad is None or torch.all(fixed_layer.w_base.grad == 0), (
+        "w_base must receive zero/None gradient when fixed_alpha is used."
+    )
+    assert (
+        fixed_layer.w_stage.weight.grad is None
+        or torch.all(fixed_layer.w_stage.weight.grad == 0)
+    ), "w_stage must receive zero/None gradient when fixed_alpha is used."
+
+    # 7. fixed_alpha and freeze_uniform must be mutually exclusive.
+    try:
+        fixed_layer(feats, stage_idx, freeze_uniform=True)
+        raise AssertionError("Expected ValueError when fixed_alpha and freeze_uniform are both used.")
+    except ValueError:
+        pass
 
     print("sca_layer.py smoke test: all checks passed.")
