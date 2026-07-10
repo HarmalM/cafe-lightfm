@@ -1,42 +1,26 @@
 """
 Phase 3, Step 7b - CAFE-LightFM fixed-stage-weights ablation.
 
-Purpose (validation-only, synthetic-v3 pipeline check - no scientific claim):
-    This experiment compares:
+Validation-only synthetic-v3 pipeline check.
+No scientific superiority or necessity claim should be made from this script.
 
-        Full CAFE-LightFM
-        learned stage-conditioned attention
+This script compares:
+    model_a: Full CAFE-LightFM with learned stage-conditioned attention
+    model_b: CAFE-LightFM with fixed stage-conditioned attention weights
 
-    against:
-
-        CAFE-LightFM-fixed-stage-weights
-        stage-conditioned attention weights frozen at the empirical
-        Step 6 aggregate alpha values.
-
-    The purpose is to test whether end-to-end learning of the
-    stage-conditioned attention weights adds value beyond simply using a
-    fixed stage-specific attention pattern.
-
-Validation scope:
-    This is a synthetic-v3 validation-only pipeline check. No scientific
-    superiority, necessity, or publishable performance claim should be made
-    from this script. Formal claims remain reserved for the Prolific pilot
-    and full study.
-
-Author: CAFE-LightFM project (Paper I). Seed = 42 throughout.
+RNG-control note:
+    For fair comparison, torch.manual_seed(seed) is set immediately before
+    model construction and immediately before training for both Full CAFE and
+    FixedStageWeights.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import torch
 
-# --- Reused, not reimplemented -------------------------------------------
-# This script must not duplicate ranking, NDCG, Precision, or statistical
-# testing logic. It only wires one new fixed-alpha model variant into the
-# existing data, training, and Step 7 CAFE-vs-CAFE evaluation pipeline.
 from data.synthetic_generator_v3 import generate_synthetic_dataset_v3
 from data.interaction_matrix import build_interaction_matrix
 from experiments.training_loop import TrainingConfig, train_cafe_lightfm
@@ -46,12 +30,11 @@ from models.cafe_lightfm.cafe_lightfm import CAFELightFM
 
 SEED = 42
 
-FULL_CAFE_CHECKPOINT = Path("outputs/checkpoints/cafe_lightfm_v3_seed42.pt")
+CHECKPOINT_DIR = Path("outputs/checkpoints")
+FULL_CAFE_CHECKPOINT = CHECKPOINT_DIR / "cafe_lightfm_v3_seed42.pt"
+FIXED_STAGE_WEIGHTS_CHECKPOINT = CHECKPOINT_DIR / "cafe_lightfm_fixed_stage_weights_v3_seed42.pt"
 
 
-# Frozen per-stage attention weights reused verbatim from the Phase 3
-# Step 6 aggregated feature-stage matrix.
-# Order: [category, program].
 FIXED_STAGE_ALPHA: Dict[str, torch.Tensor] = {
     "S1": torch.tensor([0.6144, 0.3856], dtype=torch.float32),
     "S2": torch.tensor([0.6035, 0.3965], dtype=torch.float32),
@@ -60,7 +43,6 @@ FIXED_STAGE_ALPHA: Dict[str, torch.Tensor] = {
 
 
 def _validate_fixed_alpha(fixed_alpha: Dict[str, torch.Tensor]) -> None:
-    """Fail fast if the frozen attention distributions are malformed."""
     expected_stages = {"S1", "S2", "S3"}
 
     if set(fixed_alpha.keys()) != expected_stages:
@@ -92,36 +74,23 @@ def _validate_fixed_alpha(fixed_alpha: Dict[str, torch.Tensor]) -> None:
 
 
 def _extract_state_dict(checkpoint) -> Dict[str, torch.Tensor]:
-    """Extract a PyTorch state_dict from common checkpoint formats."""
     if isinstance(checkpoint, dict):
         for key in ("model_state_dict", "state_dict"):
             value = checkpoint.get(key)
             if isinstance(value, dict):
                 return value
 
-        # Raw state_dict format: {"layer.weight": tensor, ...}
         if checkpoint and all(torch.is_tensor(v) for v in checkpoint.values()):
             return checkpoint
 
     raise ValueError(
-        "Could not extract model state_dict from checkpoint. Expected either "
-        "a raw state_dict, or a dict containing 'model_state_dict' or 'state_dict'."
+        "Could not extract model state_dict from checkpoint. Expected a raw "
+        "state_dict or a dict containing 'model_state_dict' or 'state_dict'."
     )
 
 
-def build_full_cafe_model(
-    bundle,
-    embedding_dim: int = 64,
-    checkpoint_path: Path = FULL_CAFE_CHECKPOINT,
-) -> CAFELightFM:
-    """Load the trained Full CAFE-LightFM checkpoint used as model_a."""
-    if not checkpoint_path.exists():
-        raise FileNotFoundError(
-            f"Full CAFE checkpoint not found: {checkpoint_path}. "
-            "Run Phase 3 Step 5 first, or confirm the checkpoint path."
-        )
-
-    model = CAFELightFM(
+def _make_full_cafe_model(bundle, embedding_dim: int) -> CAFELightFM:
+    return CAFELightFM(
         n_users=bundle.n_users,
         n_items=bundle.n_items,
         n_categories=bundle.n_categories,
@@ -130,12 +99,50 @@ def build_full_cafe_model(
         embedding_dim=embedding_dim,
     )
 
-    checkpoint = torch.load(checkpoint_path, map_location="cpu")
-    state_dict = _extract_state_dict(checkpoint)
-    model.load_state_dict(state_dict)
+
+def build_or_train_full_cafe_model(
+    bundle,
+    config: TrainingConfig,
+    checkpoint_path: Path = FULL_CAFE_CHECKPOINT,
+) -> Tuple[CAFELightFM, Optional[object], str]:
+    """
+    Load Full CAFE-LightFM checkpoint if available.
+    If missing, retrain Full CAFE-LightFM and save the checkpoint.
+
+    RNG policy:
+        - seed before model construction
+        - seed before training
+    """
+    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+
+    torch.manual_seed(config.seed)
+    model = _make_full_cafe_model(bundle=bundle, embedding_dim=config.embedding_dim)
+
+    if checkpoint_path.exists():
+        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        state_dict = _extract_state_dict(checkpoint)
+        model.load_state_dict(state_dict)
+        model.eval()
+        return model, None, "loaded_checkpoint"
+
+    torch.manual_seed(config.seed)
+    training_log = train_cafe_lightfm(
+        model=model,
+        bundle=bundle,
+        config=config,
+    )
+
     model.eval()
 
-    return model
+    if training_log.epochs:
+        assert training_log.epochs[-1].mean_loss < training_log.epochs[0].mean_loss, (
+            "Full CAFE-LightFM training loss did not decrease. "
+            "Check optimizer/data before trusting evaluation output."
+        )
+
+    torch.save(model.state_dict(), checkpoint_path)
+
+    return model, training_log, "retrained_missing_checkpoint"
 
 
 def build_fixed_stage_weights_model(
@@ -143,7 +150,6 @@ def build_fixed_stage_weights_model(
     embedding_dim: int = 64,
     fixed_alpha: Optional[Dict[str, torch.Tensor]] = None,
 ) -> CAFELightFM:
-    """Construct a CAFE-LightFM instance whose SCA attention is frozen."""
     fixed_alpha = fixed_alpha or FIXED_STAGE_ALPHA
     _validate_fixed_alpha(fixed_alpha)
 
@@ -161,15 +167,6 @@ def build_fixed_stage_weights_model(
 
 
 def run_fixed_stage_weights_ablation(seed: int = SEED) -> dict:
-    """Train and evaluate the fixed-stage-weights variant on synthetic-v3.
-
-    Evaluation design:
-        model_a = Full CAFE-LightFM checkpoint
-        model_b = CAFE-LightFM-fixed-stage-weights
-
-    The paired comparison is run using Step 7's CAFE-vs-CAFE comparison
-    function, not Step 4's CAFE-vs-LightFM baseline function.
-    """
     torch.manual_seed(seed)
 
     records = generate_synthetic_dataset_v3(seed=seed)
@@ -185,19 +182,21 @@ def run_fixed_stage_weights_ablation(seed: int = SEED) -> dict:
         seed=seed,
     )
 
-    full_model = build_full_cafe_model(
+    full_model, full_training_log, full_model_source = build_or_train_full_cafe_model(
         bundle=bundle,
-        embedding_dim=config.embedding_dim,
+        config=config,
         checkpoint_path=FULL_CAFE_CHECKPOINT,
     )
 
+    torch.manual_seed(seed)
     fixed_model = build_fixed_stage_weights_model(
         bundle=bundle,
         embedding_dim=config.embedding_dim,
         fixed_alpha=FIXED_STAGE_ALPHA,
     )
 
-    training_log = train_cafe_lightfm(
+    torch.manual_seed(seed)
+    fixed_training_log = train_cafe_lightfm(
         model=fixed_model,
         bundle=bundle,
         config=config,
@@ -205,11 +204,17 @@ def run_fixed_stage_weights_ablation(seed: int = SEED) -> dict:
 
     fixed_model.eval()
 
-    if training_log.epochs:
-        assert training_log.epochs[-1].mean_loss < training_log.epochs[0].mean_loss, (
+    if fixed_training_log.epochs:
+        assert (
+            fixed_training_log.epochs[-1].mean_loss
+            < fixed_training_log.epochs[0].mean_loss
+        ), (
             "fixedStageWeights training loss did not decrease. "
             "Check optimizer/data before trusting evaluation output."
         )
+
+    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+    torch.save(fixed_model.state_dict(), FIXED_STAGE_WEIGHTS_CHECKPOINT)
 
     comparison = run_cafe_variant_paired_comparison(
         model_a=full_model,
@@ -218,24 +223,29 @@ def run_fixed_stage_weights_ablation(seed: int = SEED) -> dict:
         k_values=(5, 10, 20),
     )
 
-    comparison["variant_name"] = "fixed_stage_weights"
-    comparison["model_a"] = "full_cafe_lightfm_checkpoint"
-    comparison["model_b"] = "fixed_stage_weights"
-    comparison["scope_reminder"] = (
-        "VALIDATION-ONLY: synthetic-v3 pipeline check. No scientific "
-        "superiority or necessity claim is made. Formal claims are "
-        "reserved for the Prolific pilot (N=50) / full study (N=300)."
-    )
+    return {
+        "variant_name": "fixed_stage_weights",
+        "model_a": "full_cafe_lightfm",
+        "model_b": "fixed_stage_weights",
+        "full_model_source": full_model_source,
+        "full_checkpoint_path": str(FULL_CAFE_CHECKPOINT),
+        "fixed_checkpoint_path": str(FIXED_STAGE_WEIGHTS_CHECKPOINT),
+        "comparison": comparison,
+        "rng_control": {
+            "seed": seed,
+            "full_model_seeded_before_construction": True,
+            "full_model_seeded_before_training": True,
+            "fixed_model_seeded_before_construction": True,
+            "fixed_model_seeded_before_training": True,
+        },
+        "scope_reminder": (
+            "VALIDATION-ONLY: synthetic-v3 pipeline check. No scientific "
+            "superiority or necessity claim is made."
+        ),
+    }
 
-    return comparison
-
-
-# --------------------------------------------------------------------- #
-# Smoke tests
-# --------------------------------------------------------------------- #
 
 def test_fixed_alpha_validation_accepts_locked_values():
-    """The locked Step-6-derived weights must pass validation unchanged."""
     _validate_fixed_alpha(FIXED_STAGE_ALPHA)
 
 
@@ -281,7 +291,6 @@ def test_fixed_alpha_validation_rejects_negative_weight():
 
 
 def test_locked_weights_match_step6_source_values():
-    """Guards against silent drift between this file and the Step 6 report."""
     assert torch.allclose(
         FIXED_STAGE_ALPHA["S1"],
         torch.tensor([0.6144, 0.3856]),
