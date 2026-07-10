@@ -21,6 +21,12 @@ PHASE 3, STEP 7 ADDITION (2026-07-06, confirmed by PI):
     ablation (proposal Section 5.6). Default False preserves Step 1-6
     behavior exactly (additive, backward-compatible).
 
+PHASE 3, STEP 7b ADDITION:
+    `fixed_alpha: Optional[Dict[str, torch.Tensor]] = None` added to
+    `__init__()` and passed into StageConditionedAttention. This supports
+    the "CAFE-LightFM-fixed-stage-weights" ablation. Default None preserves
+    all previous Step 1-7 behavior.
+
 References
 ----------
 [1] Kula, M. (2015). Metadata Embeddings for User and Item Cold-start
@@ -30,7 +36,7 @@ References
 
 from __future__ import annotations
 
-from typing import Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -50,6 +56,7 @@ class CAFELightFM(nn.Module):
         n_programs: int,
         n_stages: int,
         embedding_dim: int = 64,
+        fixed_alpha: Optional[Dict[str, torch.Tensor]] = None,
     ) -> None:
         super().__init__()
         self.embedding_dim = embedding_dim
@@ -72,7 +79,14 @@ class CAFELightFM(nn.Module):
         # (see sca_layer.py) and therefore consume no RNG state, so
         # placing this after the embeddings above does not disturb the
         # RNG-alignment property used by the equivalence test.
-        self.sca = StageConditionedAttention(n_stages, embedding_dim)
+        #
+        # NEW: fixed_alpha is passed through for Step 7b. When None,
+        # StageConditionedAttention preserves the original learned path.
+        self.sca = StageConditionedAttention(
+            n_stages=n_stages,
+            embedding_dim=embedding_dim,
+            fixed_alpha=fixed_alpha,
+        )
 
     def _init_weights(self) -> None:
         for emb in (
@@ -111,11 +125,20 @@ class CAFELightFM(nn.Module):
         (q_i, alpha) where alpha has shape (batch, 2) -- attention
         weights over [item_category, program_type], in that order.
         """
-        cat_emb = self.category_embedding(category_idx)  # (batch, d)
-        prog_emb = self.program_embedding(program_idx)    # (batch, d)
-        feature_embeddings = torch.stack([cat_emb, prog_emb], dim=1)  # (batch, 2, d)
+        cat_emb = self.category_embedding(category_idx)    # (batch, d)
+        prog_emb = self.program_embedding(program_idx)     # (batch, d)
 
-        weighted_sum, alpha = self.sca(feature_embeddings, stage_idx, freeze_uniform=freeze_uniform)
+        feature_embeddings = torch.stack(
+            [cat_emb, prog_emb],
+            dim=1,
+        )  # (batch, 2, d)
+
+        weighted_sum, alpha = self.sca(
+            feature_embeddings,
+            stage_idx,
+            freeze_uniform=freeze_uniform,
+        )
+
         q_i = self.item_embedding(item_idx) + weighted_sum
         return q_i, alpha
 
@@ -131,12 +154,19 @@ class CAFELightFM(nn.Module):
         """Returns (score, alpha) -- use this when attention weights are
         needed for interpretability analysis (proposal Section 6.2)."""
         q_u = self.user_representation(user_idx)
+
         q_i, alpha = self.item_representation(
-            item_idx, category_idx, program_idx, stage_idx, freeze_uniform=freeze_uniform
+            item_idx,
+            category_idx,
+            program_idx,
+            stage_idx,
+            freeze_uniform=freeze_uniform,
         )
+
         dot = (q_u * q_i).sum(dim=-1)
         b_u = self.user_bias(user_idx).squeeze(-1)
         b_i = self.item_bias(item_idx).squeeze(-1)
+
         return dot + b_u + b_i, alpha
 
     def forward(
@@ -158,45 +188,132 @@ class CAFELightFM(nn.Module):
             Step 1-6 call sites exactly.
         """
         score, _alpha = self.forward_with_attention(
-            user_idx, item_idx, category_idx, program_idx, stage_idx, freeze_uniform=freeze_uniform
+            user_idx,
+            item_idx,
+            category_idx,
+            program_idx,
+            stage_idx,
+            freeze_uniform=freeze_uniform,
         )
+
         return score
 
 
 if __name__ == "__main__":
     # Self-contained smoke test (no conftest dependency).
-    def _setup():
+    def _setup(fixed_alpha=None):
         torch.manual_seed(42)
+
         model = CAFELightFM(
-            n_users=4, n_items=6, n_categories=1, n_programs=3, n_stages=3, embedding_dim=8
+            n_users=4,
+            n_items=6,
+            n_categories=1,
+            n_programs=3,
+            n_stages=3,
+            embedding_dim=8,
+            fixed_alpha=fixed_alpha,
         )
+
         user_idx = torch.tensor([0, 1, 2, 3])
         item_idx = torch.tensor([0, 1, 2, 3])
         category_idx = torch.zeros(4, dtype=torch.long)
         program_idx = torch.tensor([0, 1, 2, 0])
         stage_idx = torch.tensor([0, 1, 2, 0])
+
         return model, user_idx, item_idx, category_idx, program_idx, stage_idx
 
     model, user_idx, item_idx, category_idx, program_idx, stage_idx = _setup()
 
-    # 1. Default forward (freeze_uniform=False) must still run and return
-    #    a (batch,) score tensor.
-    scores_default = model(user_idx, item_idx, category_idx, program_idx, stage_idx)
+    # 1. Default forward must still run and return a (batch,) score tensor.
+    scores_default = model(
+        user_idx,
+        item_idx,
+        category_idx,
+        program_idx,
+        stage_idx,
+    )
+
     assert scores_default.shape == (4,), "Default forward output shape mismatch."
 
     # 2. freeze_uniform=True must also run, and at zero-init must produce
-    #    IDENTICAL scores to the default path (equivalence property).
+    #    identical scores to the default path.
     scores_frozen = model(
-        user_idx, item_idx, category_idx, program_idx, stage_idx, freeze_uniform=True
+        user_idx,
+        item_idx,
+        category_idx,
+        program_idx,
+        stage_idx,
+        freeze_uniform=True,
     )
+
     assert torch.allclose(scores_default, scores_frozen, atol=1e-6), (
         "At zero-init, freeze_uniform=True scores must match default scores."
     )
 
     # 3. forward_with_attention must expose alpha with the correct shape.
     _, alpha = model.forward_with_attention(
-        user_idx, item_idx, category_idx, program_idx, stage_idx, freeze_uniform=True
+        user_idx,
+        item_idx,
+        category_idx,
+        program_idx,
+        stage_idx,
+        freeze_uniform=True,
     )
+
     assert alpha.shape == (4, 2), "Alpha shape must be (batch, 2)."
+
+    # 4. fixed_alpha model must run and return the expected per-stage alpha.
+    fixed_alpha = {
+        "S1": torch.tensor([0.6144, 0.3856], dtype=torch.float32),
+        "S2": torch.tensor([0.6035, 0.3965], dtype=torch.float32),
+        "S3": torch.tensor([0.6724, 0.3276], dtype=torch.float32),
+    }
+
+    fixed_model, user_idx, item_idx, category_idx, program_idx, stage_idx = _setup(
+        fixed_alpha=fixed_alpha
+    )
+
+    fixed_scores, fixed_alpha_out = fixed_model.forward_with_attention(
+        user_idx,
+        item_idx,
+        category_idx,
+        program_idx,
+        stage_idx,
+    )
+
+    assert fixed_scores.shape == (4,), "fixed_alpha forward output shape mismatch."
+    assert fixed_alpha_out.shape == (4, 2), "fixed_alpha alpha shape must be (batch, 2)."
+
+    expected_alpha = torch.stack(
+        [
+            fixed_alpha["S1"],
+            fixed_alpha["S2"],
+            fixed_alpha["S3"],
+            fixed_alpha["S1"],
+        ],
+        dim=0,
+    )
+
+    assert torch.allclose(fixed_alpha_out, expected_alpha, atol=1e-6), (
+        "fixed_alpha model must return the exact locked per-stage attention values."
+    )
+
+    # 5. fixed_alpha and freeze_uniform must be mutually exclusive.
+    try:
+        fixed_model(
+            user_idx,
+            item_idx,
+            category_idx,
+            program_idx,
+            stage_idx,
+            freeze_uniform=True,
+        )
+
+        raise AssertionError(
+            "Expected ValueError when fixed_alpha and freeze_uniform are both used."
+        )
+
+    except ValueError:
+        pass
 
     print("cafe_lightfm.py smoke test: all checks passed.")
