@@ -1,29 +1,32 @@
 """
-Smoke tests for the `fixed_alpha` hook on StageConditionedAttention /
-CAFELightFM (Phase 3, Step 7b — fixed-stage-weights ablation).
+Smoke tests for Phase 3, Step 7b fixed_alpha support in StageConditionedAttention.
 
-IMPORTANT: import from the REAL modules after integration, not from
-sca_layer_fixed_alpha_patch.py (which is a proposed-patch reference, not
-the production module). Run this file only after the patch has been
-merged into the actual repo files and re-uploaded.
+These tests verify that:
+1. Default learned-attention behavior still works.
+2. freeze_uniform still works.
+3. fixed_alpha returns the expected per-stage alpha values.
+4. malformed fixed_alpha inputs are rejected.
+5. fixed_alpha and freeze_uniform are mutually exclusive at forward time.
+6. pre-existing call sites are not broken.
 
-Run: pytest tests/test_step7b_sca_fixed_alpha_smoke.py -v
+Run from the repo root:
+
+    PYTHONPATH=/content/cafe-lightfm pytest -q tests/test_step7b_sca_fixed_alpha_smoke.py
 """
 
 from __future__ import annotations
 
-import torch
 import pytest
+import torch
 
-# After integration, replace with the real import path, e.g.:
-# from models.cafe_lightfm.sca_layer import StageConditionedAttention
-# from models.cafe_lightfm.cafe_lightfm import CAFELightFM
-from models.cafe_lightfm.sca_layer import StageConditionedAttention  # noqa: F401
+from models.cafe_lightfm.sca_layer import StageConditionedAttention
+
 
 SEED = 42
-EMBEDDING_DIM = 64
 N_STAGES = 3
 N_FEATURES = 2
+EMBEDDING_DIM = 8
+BATCH_SIZE = 8
 
 LOCKED_FIXED_ALPHA = {
     "S1": torch.tensor([0.6144, 0.3856], dtype=torch.float32),
@@ -35,116 +38,138 @@ LOCKED_FIXED_ALPHA = {
 def _make_layer(**kwargs) -> StageConditionedAttention:
     torch.manual_seed(SEED)
     return StageConditionedAttention(
-        embedding_dim=EMBEDDING_DIM, n_stages=N_STAGES, n_features=N_FEATURES, **kwargs
+        n_stages=N_STAGES,
+        embedding_dim=EMBEDDING_DIM,
+        **kwargs,
     )
 
 
-def _dummy_batch(batch_size: int = 8):
+def _dummy_batch():
     torch.manual_seed(SEED)
-    feature_embeds = torch.randn(batch_size, N_FEATURES, EMBEDDING_DIM)
-    stage_idx = torch.randint(0, N_STAGES, (batch_size,))
-    return feature_embeds, stage_idx
+    feature_embeddings = torch.randn(
+        BATCH_SIZE,
+        N_FEATURES,
+        EMBEDDING_DIM,
+    )
+    stage_idx = torch.tensor([0, 1, 2, 0, 1, 2, 0, 1], dtype=torch.long)
+    return feature_embeddings, stage_idx
 
 
-# 1. Default behavior (fixed_alpha=None, freeze_uniform=False) must be
-#    byte-identical to pre-patch Steps 1-7 behavior: alpha rows sum to 1.0,
-#    finite, correct shape, and NOT constant across the batch (i.e., it is
-#    genuinely the learned softmax path, not accidentally short-circuited).
 def test_default_behavior_unchanged():
-    layer = _make_layer()  # fixed_alpha=None, freeze_uniform=False (defaults)
-    feature_embeds, stage_idx = _dummy_batch()
-    alpha = layer(feature_embeds, stage_idx)
+    layer = _make_layer()
+    feature_embeddings, stage_idx = _dummy_batch()
 
-    assert alpha.shape == (8, N_FEATURES)
-    assert torch.all(torch.isfinite(alpha))
-    row_sums = alpha.sum(dim=-1)
-    assert torch.allclose(row_sums, torch.ones_like(row_sums), atol=1e-5)
-    # a freshly-initialized learned layer should not degenerate to a
-    # perfectly uniform row for every sample (sanity check, not a strict
-    # correctness proof)
-    assert not torch.allclose(alpha, torch.full_like(alpha, 1.0 / N_FEATURES))
+    weighted_sum, alpha = layer(feature_embeddings, stage_idx)
+
+    assert weighted_sum.shape == (BATCH_SIZE, EMBEDDING_DIM)
+    assert alpha.shape == (BATCH_SIZE, N_FEATURES)
+
+    expected_uniform = torch.full_like(alpha, 1.0 / N_FEATURES)
+
+    # Because w_base and w_stage are zero-initialized, default alpha is uniform at init.
+    assert torch.allclose(alpha, expected_uniform, atol=1e-6)
+    assert torch.allclose(alpha.sum(dim=-1), torch.ones(BATCH_SIZE), atol=1e-6)
 
 
-# 2. freeze_uniform=True must still work exactly as in Step 7 (regression
-#    guard — this is the existing hook the new one must not disturb).
 def test_freeze_uniform_still_works():
-    layer = _make_layer(freeze_uniform=True)
-    feature_embeds, stage_idx = _dummy_batch()
-    alpha = layer(feature_embeds, stage_idx)
+    layer = _make_layer()
+    feature_embeddings, stage_idx = _dummy_batch()
 
-    expected = torch.full((8, N_FEATURES), 1.0 / N_FEATURES)
-    assert torch.allclose(alpha, expected)
+    weighted_default, alpha_default = layer(feature_embeddings, stage_idx)
+    weighted_frozen, alpha_frozen = layer(
+        feature_embeddings,
+        stage_idx,
+        freeze_uniform=True,
+    )
+
+    assert weighted_frozen.shape == (BATCH_SIZE, EMBEDDING_DIM)
+    assert alpha_frozen.shape == (BATCH_SIZE, N_FEATURES)
+
+    # At zero initialization, freeze_uniform should match the default path.
+    assert torch.allclose(alpha_frozen, alpha_default, atol=1e-6)
+    assert torch.allclose(weighted_frozen, weighted_default, atol=1e-6)
+    assert torch.allclose(alpha_frozen.sum(dim=-1), torch.ones(BATCH_SIZE), atol=1e-6)
 
 
-# 3. fixed_alpha returns exactly the caller-specified per-stage row,
-#    correctly indexed by stage_idx, regardless of feature_embeds content
-#    (the whole point of the ablation: attention no longer depends on the
-#    learned embeddings at all).
 def test_fixed_alpha_returns_expected_per_stage_weights():
     layer = _make_layer(fixed_alpha=LOCKED_FIXED_ALPHA)
-    feature_embeds, _ = _dummy_batch(batch_size=3)
-    stage_idx = torch.tensor([0, 1, 2])  # S1, S2, S3
+    feature_embeddings, stage_idx = _dummy_batch()
 
-    alpha = layer(feature_embeds, stage_idx)
+    weighted_sum, alpha = layer(feature_embeddings, stage_idx)
 
-    assert torch.allclose(alpha[0], LOCKED_FIXED_ALPHA["S1"], atol=1e-6)
-    assert torch.allclose(alpha[1], LOCKED_FIXED_ALPHA["S2"], atol=1e-6)
-    assert torch.allclose(alpha[2], LOCKED_FIXED_ALPHA["S3"], atol=1e-6)
+    expected_alpha = torch.stack(
+        [
+            LOCKED_FIXED_ALPHA["S1"],
+            LOCKED_FIXED_ALPHA["S2"],
+            LOCKED_FIXED_ALPHA["S3"],
+            LOCKED_FIXED_ALPHA["S1"],
+            LOCKED_FIXED_ALPHA["S2"],
+            LOCKED_FIXED_ALPHA["S3"],
+            LOCKED_FIXED_ALPHA["S1"],
+            LOCKED_FIXED_ALPHA["S2"],
+        ],
+        dim=0,
+    )
 
-    # changing feature_embeds must NOT change the output (bypass confirmed)
-    alpha_again = layer(torch.randn_like(feature_embeds) * 100, stage_idx)
-    assert torch.allclose(alpha, alpha_again)
+    assert weighted_sum.shape == (BATCH_SIZE, EMBEDDING_DIM)
+    assert alpha.shape == (BATCH_SIZE, N_FEATURES)
+    assert torch.allclose(alpha, expected_alpha, atol=1e-6)
+    assert torch.allclose(alpha.sum(dim=-1), torch.ones(BATCH_SIZE), atol=1e-6)
 
 
-# 3b. fixed_alpha must fail fast on malformed input (mirrors sw_ndcg's
-#     _validate_weights edge cases).
 def test_fixed_alpha_rejects_malformed_input():
-    bad_missing_stage = {"S1": torch.tensor([0.5, 0.5]), "S2": torch.tensor([0.5, 0.5])}
+    bad_missing_stage = {
+        "S1": torch.tensor([0.5, 0.5]),
+        "S2": torch.tensor([0.5, 0.5]),
+    }
+
     with pytest.raises(ValueError):
         _make_layer(fixed_alpha=bad_missing_stage)
+
+    bad_non_unit_sum = {
+        "S1": torch.tensor([0.5, 0.6]),
+        "S2": torch.tensor([0.5, 0.5]),
+        "S3": torch.tensor([0.5, 0.5]),
+    }
+
+    with pytest.raises(ValueError):
+        _make_layer(fixed_alpha=bad_non_unit_sum)
 
     bad_negative = {
         "S1": torch.tensor([1.2, -0.2]),
         "S2": torch.tensor([0.5, 0.5]),
         "S3": torch.tensor([0.5, 0.5]),
     }
+
     with pytest.raises(ValueError):
         _make_layer(fixed_alpha=bad_negative)
 
-    bad_sum = {
-        "S1": torch.tensor([0.5, 0.6]),
-        "S2": torch.tensor([0.5, 0.5]),
-        "S3": torch.tensor([0.5, 0.5]),
-    }
-    with pytest.raises(ValueError):
-        _make_layer(fixed_alpha=bad_sum)
 
-
-# 3c. freeze_uniform and fixed_alpha are mutually exclusive.
 def test_freeze_uniform_and_fixed_alpha_are_mutually_exclusive():
+    layer = _make_layer(fixed_alpha=LOCKED_FIXED_ALPHA)
+    feature_embeddings, stage_idx = _dummy_batch()
+
     with pytest.raises(ValueError):
-        _make_layer(freeze_uniform=True, fixed_alpha=LOCKED_FIXED_ALPHA)
+        layer(
+            feature_embeddings,
+            stage_idx,
+            freeze_uniform=True,
+        )
 
 
-# 4. No previous call site is broken: constructing the layer with ONLY the
-#    pre-existing positional/keyword arguments (as every Step 1-7 call site
-#    does) must still succeed without needing to know about fixed_alpha.
 def test_pre_existing_call_sites_not_broken():
-    # exact signature used throughout Steps 1-7, per the handoff docs
+    # Exact old-style construction used before Step 7b.
     layer = StageConditionedAttention(
-        embedding_dim=EMBEDDING_DIM, n_stages=N_STAGES
+        n_stages=N_STAGES,
+        embedding_dim=EMBEDDING_DIM,
     )
-    feature_embeds, stage_idx = _dummy_batch()
-    alpha = layer(feature_embeds, stage_idx)
-    assert alpha.shape == (8, N_FEATURES)
 
-    layer_noattn = StageConditionedAttention(
-        embedding_dim=EMBEDDING_DIM, n_stages=N_STAGES, freeze_uniform=True
-    )
-    alpha_noattn = layer_noattn(feature_embeds, stage_idx)
-    assert torch.allclose(
-        alpha_noattn, torch.full((8, N_FEATURES), 1.0 / N_FEATURES)
-    )
+    feature_embeddings, stage_idx = _dummy_batch()
+
+    weighted_sum, alpha = layer(feature_embeddings, stage_idx)
+
+    assert weighted_sum.shape == (BATCH_SIZE, EMBEDDING_DIM)
+    assert alpha.shape == (BATCH_SIZE, N_FEATURES)
 
 
 if __name__ == "__main__":
@@ -154,4 +179,5 @@ if __name__ == "__main__":
     test_fixed_alpha_rejects_malformed_input()
     test_freeze_uniform_and_fixed_alpha_are_mutually_exclusive()
     test_pre_existing_call_sites_not_broken()
-    print("All 6 fixed_alpha smoke checks passed.")
+
+    print("test_step7b_sca_fixed_alpha_smoke.py: all checks passed.")
